@@ -12,6 +12,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _logger_instance = None
+_current_company = None
+
+
+def set_current_company(name):
+    """Set the current company being processed (shown in all log lines)."""
+    global _current_company
+    _current_company = name
+
+
+def get_current_company():
+    """Get the current company being processed."""
+    return _current_company
+
+
+class _CompanyFilter(logging.Filter):
+    """Injects the current company name into every log record."""
+    def filter(self, record):
+        company = _current_company
+        record.company = f" [{company}]" if company else ""
+        return True
+
 
 def setup_logger(name="Ranker_Crawler"):
     """
@@ -38,8 +59,11 @@ def setup_logger(name="Ranker_Crawler"):
         _logger_instance = logger
         return logger
 
+    company_filter = _CompanyFilter()
+    logger.addFilter(company_filter)
+
     formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s%(company)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 

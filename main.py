@@ -1,8 +1,12 @@
 """
 Ranker & Crawler Pipeline - main.py
 
+Full pipeline processes each company end-to-end (Rank → Crawl → PDF) before
+moving to the next company.  Set RESUME=true in .env to resume from where
+it last stopped, or RESUME=false to start from the beginning.
+
 Usage:
-  python main.py                                          # Full pipeline (rank + crawl + pdf_links) for ALL companies
+  python main.py                                          # Full pipeline (rank → crawl → pdf) per company
   python main.py --company_name "reliance industries"     # Full pipeline for matching company (fuzzy match)
   python main.py --rank                                   # Only rank, all companies
   python main.py --rank --company_name "bharti airtel"    # Only rank, one company
@@ -21,7 +25,7 @@ import re
 from pathlib import Path
 from dotenv import load_dotenv
 
-from logger import setup_logger
+from logger import setup_logger, set_current_company
 from utils import clean_company_name, save_json, load_json
 from ranker import rank_investor_pages
 from scraper import PageCrawler
@@ -323,6 +327,51 @@ def _save_pdf_links(company_name: str, links: list, logger):
 
 
 # ============================================================================
+# PROGRESS TRACKING (for RESUME feature)
+# ============================================================================
+
+PROGRESS_FILENAME = "progress.json"
+
+
+def _get_progress_path() -> str:
+    """Return path to the progress tracking file (DATA/progress.json)."""
+    raw_path = os.getenv("DATA_RAW_PATH", "DATA/Raw")
+    data_root = os.path.dirname(raw_path)          # DATA/
+    if not data_root:
+        data_root = "DATA"
+    return os.path.join(data_root, PROGRESS_FILENAME)
+
+
+def _load_completed(logger) -> set:
+    """Load the set of completed company folder names from progress file."""
+    progress_path = _get_progress_path()
+    if not os.path.exists(progress_path):
+        return set()
+    data = load_json(progress_path)
+    if data and isinstance(data, dict):
+        completed = set(data.get("completed", []))
+        logger.info(f"Loaded progress: {len(completed)} companies already completed.")
+        return completed
+    return set()
+
+
+def _save_completed(completed: set, logger):
+    """Persist the set of completed company folder names."""
+    progress_path = _get_progress_path()
+    folder = os.path.dirname(progress_path) or "."
+    fname = os.path.basename(progress_path)
+    save_json({"completed": sorted(list(completed))}, folder, fname)
+
+
+def _clear_progress(logger):
+    """Delete the progress file to start fresh."""
+    progress_path = _get_progress_path()
+    if os.path.exists(progress_path):
+        os.remove(progress_path)
+        logger.info("Cleared previous progress (RESUME=false).")
+
+
+# ============================================================================
 # ARGUMENT PARSING
 # ============================================================================
 
@@ -361,8 +410,10 @@ def main():
     ranked_path = os.getenv("DATA_RANKED_PATH", "DATA/Ranked")
     crawled_path = os.getenv("DATA_CRAWLED_PATH", "DATA/Crawled")
 
+    # Resume switch from .env
+    resume_enabled = os.getenv("RESUME", "true").lower() == "true"
+
     # Determine which steps to run
-    # If none of --rank, --crawl, --pdf are set, run full pipeline
     run_rank = args.rank
     run_crawl = args.crawl
     run_pdf = args.pdf
@@ -370,70 +421,172 @@ def main():
 
     company_query = args.company_name  # may be None (means all)
 
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # FULL PIPELINE: per-company (rank → crawl → pdf → next company)
+    # ------------------------------------------------------------------
+    if full_pipeline:
+        logger.info("=" * 60)
+        logger.info("FULL PIPELINE (per-company: Rank → Crawl → PDF)")
+        logger.info("=" * 60)
+
+        if not os.path.isdir(raw_path):
+            logger.error(f"Raw data path not found: {raw_path}")
+            return
+
+        # Get target folders
+        if company_query:
+            targets = find_matching_folders(raw_path, company_query)
+            if not targets:
+                logger.warning(f"No folders matching '{company_query}' in {raw_path}")
+                return
+        else:
+            targets = get_all_folders(raw_path)
+
+        total = len(targets)
+        logger.info(f"Found {total} company folder(s) to process.")
+
+        # Resume logic
+        completed = set()
+        if resume_enabled:
+            completed = _load_completed(logger)
+        else:
+            _clear_progress(logger)
+
+        for i, folder in enumerate(targets, 1):
+            folder_name = os.path.basename(folder)
+
+            # Skip already completed (resume mode)
+            if resume_enabled and folder_name in completed:
+                logger.info(f"[{i}/{total}] SKIPPING (already completed): {folder_name}")
+                continue
+
+            # Derive a display-friendly company name from folder
+            display_name = clean_company_name(folder_name.replace("_", " "))
+            set_current_company(display_name)
+
+            logger.info("=" * 60)
+            logger.info(f"[{i}/{total}] STARTING COMPANY: {display_name}")
+            logger.info("=" * 60)
+
+            try:
+                # --- Step 1: RANK ---
+                logger.info("-" * 40)
+                logger.info("Step 1/3: RANKING")
+                logger.info("-" * 40)
+                company_name = step_rank(folder, logger)
+                if not company_name:
+                    logger.warning(f"Ranking failed for {folder_name}, skipping.")
+                    continue
+
+                # Update logger with the actual resolved company name
+                set_current_company(company_name)
+
+                # --- Step 2: CRAWL ---
+                logger.info("-" * 40)
+                logger.info("Step 2/3: CRAWLING")
+                logger.info("-" * 40)
+                ranked_file = os.path.join(ranked_path, f"{company_name}_ranked.json")
+                if not os.path.exists(ranked_file):
+                    logger.warning(f"Ranked file not found: {ranked_file}, skipping crawl.")
+                    continue
+
+                company_name, crawled_data, _ = step_crawl(ranked_file, logger)
+
+                # --- Step 3: PDF LINKS ---
+                # (step_crawl already saves PDF links, but log the step)
+                logger.info("-" * 40)
+                logger.info("Step 3/3: PDF LINK EXTRACTION (saved during crawl)")
+                logger.info("-" * 40)
+
+                # If crawl produced data, verify pdf links were saved
+                pdf_links_path = os.getenv("DATA_PDF_LINKS_PATH", "DATA/Pdf_links")
+                pdf_file = os.path.join(pdf_links_path, f"{company_name}.json")
+                if os.path.exists(pdf_file):
+                    pdf_data = load_json(pdf_file)
+                    count = pdf_data.get("metadata", {}).get("unique_links_count", 0) if pdf_data else 0
+                    logger.info(f"PDF links file exists: {count} unique links.")
+                else:
+                    logger.warning(f"PDF links file not found for {company_name}.")
+
+                # Mark completed and persist progress
+                completed.add(folder_name)
+                _save_completed(completed, logger)
+
+                logger.info(f"[{i}/{total}] COMPLETED: {company_name}")
+
+            except Exception as e:
+                logger.error(f"Error processing {folder_name}: {e}", exc_info=True)
+
+        set_current_company(None)
+        logger.info("=" * 60)
+        logger.info(f"Pipeline finished. {len(completed)} / {total} companies completed.")
+        logger.info("=" * 60)
+        return
+
+    # ------------------------------------------------------------------
+    # INDIVIDUAL STEPS (--rank / --crawl / --pdf)
+    # ------------------------------------------------------------------
+
     # STEP: RANK
-    # -----------------------------------------------------------------------
-    if full_pipeline or run_rank:
+    if run_rank:
         logger.info("=" * 60)
         logger.info("STEP: RANKING")
         logger.info("=" * 60)
 
         if not os.path.isdir(raw_path):
             logger.error(f"Raw data path not found: {raw_path}")
-            if not full_pipeline:
+            return
+
+        if company_query:
+            targets = find_matching_folders(raw_path, company_query)
+            if not targets:
+                logger.warning(f"No folders matching '{company_query}' in {raw_path}")
                 return
         else:
-            if company_query:
-                targets = find_matching_folders(raw_path, company_query)
-                if not targets:
-                    logger.warning(f"No folders matching '{company_query}' in {raw_path}")
-                    if not full_pipeline:
-                        return
-            else:
-                targets = get_all_folders(raw_path)
+            targets = get_all_folders(raw_path)
 
-            logger.info(f"Found {len(targets)} folder(s) to rank.")
-            for folder in targets:
-                try:
-                    step_rank(folder, logger)
-                except Exception as e:
-                    logger.error(f"Error ranking {folder}: {e}")
+        logger.info(f"Found {len(targets)} folder(s) to rank.")
+        for folder in targets:
+            try:
+                display_name = clean_company_name(os.path.basename(folder).replace("_", " "))
+                set_current_company(display_name)
+                company_name = step_rank(folder, logger)
+                if company_name:
+                    set_current_company(company_name)
+            except Exception as e:
+                logger.error(f"Error ranking {folder}: {e}")
+        set_current_company(None)
 
-    # -----------------------------------------------------------------------
     # STEP: CRAWL
-    # -----------------------------------------------------------------------
-    if full_pipeline or run_crawl:
+    if run_crawl:
         logger.info("=" * 60)
         logger.info("STEP: CRAWLING")
         logger.info("=" * 60)
 
         if not os.path.isdir(ranked_path):
             logger.error(f"Ranked data path not found: {ranked_path}")
-            if not full_pipeline:
+            return
+
+        if company_query:
+            ranked_files = find_matching_files(ranked_path, company_query, ".json")
+            if not ranked_files:
+                logger.warning(f"No ranked files matching '{company_query}' in {ranked_path}")
                 return
         else:
-            if company_query:
-                ranked_files = find_matching_files(ranked_path, company_query, ".json")
-                if not ranked_files:
-                    logger.warning(f"No ranked files matching '{company_query}' in {ranked_path}")
-                    if not full_pipeline:
-                        return
-            else:
-                ranked_files = get_all_files(ranked_path, ".json")
+            ranked_files = get_all_files(ranked_path, ".json")
 
-            logger.info(f"Found {len(ranked_files)} ranked file(s) to crawl.")
-            for rfile in ranked_files:
-                try:
-                    step_crawl(rfile, logger)
-                except Exception as e:
-                    logger.error(f"Error crawling {rfile}: {e}")
+        logger.info(f"Found {len(ranked_files)} ranked file(s) to crawl.")
+        for rfile in ranked_files:
+            try:
+                display_name = os.path.splitext(os.path.basename(rfile))[0].replace("_ranked", "").strip()
+                set_current_company(display_name)
+                step_crawl(rfile, logger)
+            except Exception as e:
+                logger.error(f"Error crawling {rfile}: {e}")
+        set_current_company(None)
 
-    # -----------------------------------------------------------------------
     # STEP: PDF LINKS
-    # -----------------------------------------------------------------------
     if run_pdf:
-        # Only runs when explicitly requested (not in full pipeline, since
-        # crawl already saves pdf links)
         logger.info("=" * 60)
         logger.info("STEP: PDF LINK EXTRACTION")
         logger.info("=" * 60)
@@ -453,9 +606,12 @@ def main():
         logger.info(f"Found {len(crawled_files)} crawled file(s) to extract PDF links from.")
         for cfile in crawled_files:
             try:
+                display_name = os.path.splitext(os.path.basename(cfile))[0].replace("_crawled", "").strip()
+                set_current_company(display_name)
                 step_pdf(cfile, logger)
             except Exception as e:
                 logger.error(f"Error extracting PDF links from {cfile}: {e}")
+        set_current_company(None)
 
     logger.info("=" * 60)
     logger.info("Pipeline finished.")

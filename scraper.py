@@ -1,12 +1,11 @@
 import os
-import re
 import heapq
+import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 import concurrent.futures
 import threading
 from dotenv import load_dotenv
-from curl_cffi import requests as curl_requests
 
 from logger import get_logger
 from utils import DelayManager, normalize_url
@@ -107,7 +106,7 @@ TARGET_SCORE = 50
 NAVIGATION_SCORE = 20
 NOISE_SCORE = -100       # Hard negative — effectively blocks it via threshold
 BASE_SCORE = 5
-DEPTH_PENALTY = 3         # Points lost per URL depth level
+DEPTH_PENALTY = 5        # Points lost per URL depth level
 SCORE_THRESHOLD = -10    # Links scoring below this are discarded, never queued
 
 
@@ -178,8 +177,8 @@ class PageCrawler:
         self.delay_manager = DelayManager()
         self.logger = get_logger()
 
-        # Thread-safe curl_cffi session (impersonates real Chrome TLS fingerprint)
-        self.session = curl_requests.Session(impersonate="chrome")
+        # Thread-safe session
+        self.session = requests.Session()
         self.session.headers.update(
             {
                 "User-Agent": self.user_agent,
@@ -245,35 +244,32 @@ class PageCrawler:
 
             collected_links = {"links": set(), "downloadables": set()}
 
-            # --- 1. Extract from <a href> tags ---
             for a_tag in soup.find_all("a", href=True):
                 href = a_tag["href"].strip()
                 if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
                     continue
-                self._classify_url(urljoin(url, href), collected_links)
 
-            # --- 2. Extract from <iframe>, <embed>, <object>, <source> src ---
-            for tag in soup.find_all(["iframe", "embed", "object", "source"]):
-                src = tag.get("src") or tag.get("data")  # <object> uses data=
-                if src:
-                    self._classify_url(urljoin(url, src.strip()), collected_links)
+                absolute_url = urljoin(url, href)
+                parsed = urlparse(absolute_url)
+                if parsed.scheme not in ("http", "https"):
+                    continue
 
-            # --- 3. Extract from data-href, data-url, data-src, data-file on any element ---
-            for tag in soup.find_all(True):
-                for attr_name in ["data-href", "data-url", "data-src", "data-file", "data-download"]:
-                    val = tag.get(attr_name)
-                    if val and isinstance(val, str) and val.strip():
-                        self._classify_url(urljoin(url, val.strip()), collected_links)
+                path_lower = parsed.path.lower()
 
-            # --- 4. Regex scan: find downloadable URLs buried in JS/JSON/inline scripts ---
-            ext_pattern = "|".join(re.escape(e) for e in self.downloadable_extensions)
-            regex = re.compile(
-                r'(https?://[^\s\'\"><\)\]]+(?:' + ext_pattern + r'))(?=[\s\'\"><\)\]\?#]|$)',
-                re.IGNORECASE
-            )
-            for match in regex.finditer(response.text):
-                found_url = match.group(1)
-                collected_links["downloadables"].add(found_url)
+                # Skip .aspx pages
+                if path_lower.endswith(".aspx") :
+                    continue
+
+                # Categorize
+                is_downloadable = False
+                for ext in self.downloadable_extensions:
+                    if path_lower.endswith(ext):
+                        collected_links["downloadables"].add(absolute_url)
+                        is_downloadable = True
+                        break
+
+                if not is_downloadable:
+                    collected_links["links"].add(absolute_url)
 
             for key in collected_links:
                 result[key] = sorted(list(collected_links[key]))
@@ -295,33 +291,6 @@ class PageCrawler:
             self.logger.error(f"Error crawling {url}: {e}")
 
         return result
-
-    def _classify_url(self, absolute_url: str, collected_links: dict):
-        """Classify a URL as a navigable link or a downloadable."""
-        parsed = urlparse(absolute_url)
-        if parsed.scheme not in ("http", "https"):
-            return
-
-        path_lower = parsed.path.lower()
-
-        # Skip .aspx pages
-        if path_lower.endswith(".aspx"):
-            return
-
-        # Check if downloadable
-        for ext in self.downloadable_extensions:
-            if path_lower.endswith(ext):
-                collected_links["downloadables"].add(absolute_url)
-                return
-
-        # Also check query string for file extensions (e.g. ?file=report.pdf)
-        query_lower = parsed.query.lower()
-        for ext in self.downloadable_extensions:
-            if ext in query_lower:
-                collected_links["downloadables"].add(absolute_url)
-                return
-
-        collected_links["links"].add(absolute_url)
 
     def normalize_url(self, url):
         return normalize_url(url)
