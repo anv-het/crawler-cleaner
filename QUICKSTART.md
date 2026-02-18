@@ -10,6 +10,10 @@ Get the Ranker & Crawler pipeline running in under 2 minutes.
 pip install requests beautifulsoup4 lxml python-dotenv
 ```
 
+Also, ensure you have Python 3.8+ installed. 
+This project works on both **Windows** and **Ubuntu/Linux**.
+
+
 ## 2. Check Your Data
 
 Make sure `DATA/Raw/` has at least one company folder with a JSON file inside:
@@ -44,7 +48,7 @@ RESUME=true                # true = resume from last stop, false = start fresh
 
 ## 4. Run
 
-### Process all companies (Rank → Crawl → PDF for each)
+### Process all companies (Rank → Crawl → Filter & Extract PDF Links)
 ```bash
 python main.py
 ```
@@ -52,6 +56,12 @@ python main.py
 ### Process one company
 ```bash
 python main.py --company_name "reliance"
+```
+
+### Only Filter & Extract Links (Parallel)
+If you already have crawled data and want to re-filter the links:
+```bash
+python main.py --pdf
 ```
 
 ### Run individual steps

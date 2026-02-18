@@ -32,7 +32,7 @@ INVESTOR_PATH_PATTERNS = [
     '/for-investors', '/investorrelations', '/investor_relations'
 ]
 
-INVESTOR_KEYWORDS = ["investor", "financial", "shareholder","investor-relations", "annual report", "quarterly results", "financials", "reports", "corporate governance"]
+INVESTOR_KEYWORDS = ["investor", "financial", "finance","finances", "shareholder", "investor-relations", "annual report", "quarterly results", "financials", "reports", "corporate governance"]
 
 # Extensions to strictly exclude
 EXCLUDED_EXTENSIONS = ['.aspx',]
@@ -40,27 +40,78 @@ EXCLUDED_EXTENSIONS = ['.aspx',]
 # Penalize non-HTML files 
 NON_HTML_EXTENSIONS = ['.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.csv', '.txt']
 
-# Trusted Authority Domains 
-AUTHORITY_DOMAINS = [
-    "bseindia.com",
-    "nseindia.com",
-    "moneycontrol.com",
-    "screener.in",
-    "trendlyne.com",
-    "economictimes.indiatimes.com",
-    "ratestar.in",
-    "ticker.finology.in",
-    "investing.com",
-    "alphaspread.com",
-    "groww.in",
-    "chittorgarh.com",
-    "zaubacorp.com",
-    "tofler.in"
+# Domains to skip entirely (not crawled, not ranked)
+SKIP_DOMAINS = [
+    "bseindia.com","nseindia.com","moneycontrol.com",
+    "screener.in","trendlyne.com","economictimes.indiatimes.com",
+    "ratestar.in","ticker.finology.in","investing.com",
+    "alphaspread.com","groww.in","chittorgarh.com",
+    "zaubacorp.com","tofler.in","finance.yahoo.com","linkdin.com"
 ]
 
 # ---------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # ---------------------------------------------------------------------------
+
+def is_likely_official_domain(company_name: str, domain: str) -> bool:
+    """
+    Check if the domain likely belongs to the official company website.
+    """
+    if not company_name or not domain:
+        return False
+    
+    # Clean company name: remove common suffixes and special chars
+    company_clean = re.sub(r'[^a-zA-Z0-9]', '', company_name.lower())
+    # Also try without common suffixes
+    for suffix in ['limited', 'ltd', 'pvtltd', 'private', 'inc', 'corp', 'corporation', 'industries', 'group']:
+        company_clean = company_clean.replace(suffix, '')
+    
+    # Extract domain core (without TLD)
+    # Handle multi-part TLDs (co.in, com.au) and subdomains (ir.360.one)
+    domain_low = domain.lower()
+    
+    # 1. Strip TLDs (naively remove last one or two parts if they are short)
+    parts = domain_low.split('.')
+    has_numbers = any(char.isdigit() for char in domain_low)
+    potential_cores = []
+    
+    if len(parts) >= 2:
+        # Standard: domain.com
+        potential_cores.append(parts[-2]) 
+        
+        # Combined: domain + tld
+        potential_cores.append(parts[-2] + parts[-1]) 
+        
+        # Subdomain + Domain
+        if len(parts) >= 3:
+             potential_cores.append(parts[-3] + parts[-2]) 
+
+    # Add the full domain string stripped of dots as a fallback
+    potential_cores.append(re.sub(r'[^a-z0-9]', '', domain_low))
+    
+    # Clean company name
+    company_clean = re.sub(r'[^a-zA-Z0-9]', '', company_name.lower())
+    
+    # Also create a version without common entity suffixes
+    company_no_suffix = company_clean
+    for suffix in ['limited', 'ltd', 'pvtltd', 'private', 'inc', 'corp', 'corporation', 'industries', 'group', 'services', 'management']:
+        company_no_suffix = company_no_suffix.replace(suffix, '')
+        
+    # CHECK MATCHING
+    for core in potential_cores:
+        core_clean = re.sub(r'[^a-z0-9]', '', core)
+        if not core_clean: continue
+        
+        # 1. Exact containment (high confidence)
+        if core_clean in company_no_suffix or company_no_suffix in core_clean:
+            return True
+            
+        # 2. Sequence matcher (fuzzy)
+        threshold = 0.7 if len(core_clean) < 5 or len(company_no_suffix) < 5 else 0.6
+        if difflib.SequenceMatcher(None, company_no_suffix, core_clean).ratio() >= threshold:
+            return True
+            
+    return False
 
 def is_investor_url(url: str) -> bool:
     """
@@ -76,10 +127,10 @@ def is_investor_url(url: str) -> bool:
     if path in ['', '/']:
         return True
     
-    # Check Authority Domains (Whitelist)
+    # Skip excluded domains entirely
     domain = extract_root_domain(url)
-    if domain in AUTHORITY_DOMAINS:
-        return True
+    if domain in SKIP_DOMAINS:
+        return False
 
     # Check exact path matches or if the pattern is a segment in the path
     for pattern in INVESTOR_PATH_PATTERNS:
@@ -111,9 +162,9 @@ def calculate_official_score(company_name: str, domain: str) -> float:
     if not company_name or not domain:
         return 0.0
 
-    # AUTHORITY DOMAIN PENALTY 
-    if domain in AUTHORITY_DOMAINS:
-        return 0.1
+    # Skip domains get zero score (they should already be filtered out)
+    if domain in SKIP_DOMAINS:
+        return 0.0
 
     company_clean = re.sub(r'[^a-zA-Z0-9]', '', company_name.lower())
     
@@ -213,8 +264,12 @@ def rank_investor_pages(company_name: str, crawled_results: List[Dict[str, Any]]
         if ".aspx" in norm_url.lower():
             continue
 
-        # Filter: Check for investor patterns
-        if not is_investor_url(norm_url):
+        domain = extract_root_domain(norm_url)
+        
+        # Filter: STRICTLY Only Allow Official Company Domains
+        is_official = is_likely_official_domain(company_name, domain)
+        
+        if not is_official:
             continue
             
         # Filter: Excluded extensions (e.g. .aspx)
@@ -223,7 +278,6 @@ def rank_investor_pages(company_name: str, crawled_results: List[Dict[str, Any]]
 
         is_doc = is_document_file(norm_url)
         
-        domain = extract_root_domain(norm_url)
         domain_counts[domain] += 1
         
         backlinks = item.get('backlinks_count', 0) or 0 # handle None

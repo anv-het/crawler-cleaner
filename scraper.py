@@ -1,4 +1,5 @@
 import os
+import re
 import heapq
 import requests
 from bs4 import BeautifulSoup
@@ -98,7 +99,7 @@ NOISE_KEYWORDS = [
     "sitemap", "action", "api", "search", "filter", "sort",
     "calculator", "tools", "converter", "weather", "calendar", "survey", "poll",
     "loans", "mortgage", "credit", "loan", "case-study", "case-studies", "partners",
-    "taxonomy", "tag", "archive", "page", "print", "share", "email", "mobile-app",
+    "taxonomy", "tag", "archive", "page", "print", "share", "email", "mobile-app","stock-screener"
 ]
 
 # Scoring Weights
@@ -157,8 +158,9 @@ def score_url(url: str) -> int:
 class PageCrawler:
     """Visit URLs and extract all hyperlinks using a scored priority queue."""
 
-    # Social media and noise domains to ignore entirely
+    # Social media, noise domains, and aggregator sites to skip entirely
     BLACKLIST_DOMAINS = {
+        # Social media
         "facebook.com", "www.facebook.com",
         "twitter.com", "www.twitter.com", "x.com",
         "linkedin.com", "www.linkedin.com",
@@ -167,7 +169,22 @@ class PageCrawler:
         "pinterest.com", "www.pinterest.com",
         "tiktok.com", "www.tiktok.com",
         "reddit.com", "www.reddit.com",
-        "whatsapp.com", "api.whatsapp.com"
+        "whatsapp.com", "api.whatsapp.com",
+        # Financial aggregators / stock portals (skip - not official company sites)
+        "bseindia.com", "www.bseindia.com",
+        "nseindia.com", "www.nseindia.com",
+        "moneycontrol.com", "www.moneycontrol.com",
+        "screener.in", "www.screener.in",
+        "trendlyne.com", "www.trendlyne.com",
+        "economictimes.indiatimes.com",
+        "ratestar.in", "www.ratestar.in",
+        "ticker.finology.in",
+        "investing.com", "www.investing.com",
+        "alphaspread.com", "www.alphaspread.com",
+        "groww.in", "www.groww.in",
+        "chittorgarh.com", "www.chittorgarh.com",
+        "zaubacorp.com", "www.zaubacorp.com",
+        "tofler.in", "www.tofler.in",
     }
 
     def __init__(self):
@@ -188,7 +205,7 @@ class PageCrawler:
                 "Connection": "keep-alive",
             }
         )
-        self.session.max_redirects = 60
+        self.session.max_redirects = 100
 
         # Global Visited Set & Lock
         self.visited = set()
@@ -207,6 +224,162 @@ class PageCrawler:
             ".zip", ".rar", ".7z", ".tar", ".gz"
         }
 
+    def _is_downloadable_url(self, url: str) -> bool:
+        """Check if the URL itself points to a downloadable file."""
+        parsed = urlparse(url.lower())
+        return any(parsed.path.endswith(ext) for ext in self.downloadable_extensions)
+
+    def _extract_urls_from_text(self, text: str, base_url: str) -> set:
+        """
+        Extract downloadable URLs from raw text (script content, JSON, etc.).
+        Uses regex to find URL patterns that point to downloadable files.
+        """
+        downloadables = set()
+        
+        # Build regex pattern for downloadable extensions
+        ext_pattern = '|'.join(re.escape(ext) for ext in self.downloadable_extensions)
+        
+        # Pattern 1: Full URLs (http/https)
+        url_pattern = rf'https?://[^\s"\'<>\)\]\}},]+?(?:{ext_pattern})(?:\?[^\s"\'<>\)\]\}},]*)?'
+        
+        # Pattern 2: Protocol-relative URLs (//domain.com/path.pdf)
+        proto_relative = rf'//[^\s"\'<>\)\]\}},]+?(?:{ext_pattern})(?:\?[^\s"\'<>\)\]\}},]*)?'
+        
+        # Pattern 3: Absolute paths (/path/to/file.pdf)
+        abs_path = rf'(?<=["\'])/[^\s"\'<>\)\]\}},]+?(?:{ext_pattern})(?:\?[^\s"\'<>\)\]\}},]*)?'
+        
+        # Find all matches
+        for pattern in [url_pattern, proto_relative]:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                # Clean up the URL
+                clean_url = match.strip().rstrip(',;')
+                if clean_url.startswith('//'):
+                    clean_url = 'https:' + clean_url
+                if self._is_valid_downloadable_url(clean_url):
+                    downloadables.add(clean_url)
+        
+        # Handle absolute paths (need base_url)
+        abs_matches = re.findall(abs_path, text, re.IGNORECASE)
+        for match in abs_matches:
+            clean_url = urljoin(base_url, match.strip().rstrip(',;'))
+            if self._is_valid_downloadable_url(clean_url):
+                downloadables.add(clean_url)
+        
+        return downloadables
+
+    def _is_valid_downloadable_url(self, url: str) -> bool:
+        """Validate that a URL is a proper downloadable link."""
+        try:
+            parsed = urlparse(url)
+            # Must have scheme and netloc
+            if not parsed.scheme or not parsed.netloc:
+                return False
+            # Must be http/https
+            if parsed.scheme not in ('http', 'https'):
+                return False
+            
+            path_lower = parsed.path.lower()
+            
+            # Check it ends with downloadable extension
+            if not any(path_lower.endswith(ext) for ext in self.downloadable_extensions):
+                return False
+            
+            # Exclude common false positives
+            false_positives = [
+                'robots.txt', 'sitemap.xml', 'manifest.json',
+                '.min.js', '.min.css', 'bundle.js',
+                'node_modules', '__pycache__',
+                'sourcemap', '.map',
+            ]
+            for fp in false_positives:
+                if fp in path_lower:
+                    return False
+            
+            return True
+        except:
+            return False
+
+    def _extract_downloadables_deep(self, soup: BeautifulSoup, html_text: str, base_url: str) -> set:
+        """
+        Deep extraction of downloadable URLs from multiple sources:
+        1. <a> tags (already done in main loop, but this catches edge cases)
+        2. <script> tags - JSON data, JS variables
+        3. data-* attributes on any element
+        4. onclick/onmousedown handlers
+        5. <iframe> src
+        6. <embed> and <object> tags
+        7. Raw regex search of entire HTML
+        """
+        downloadables = set()
+        
+        # 1. Script tags - often contain embedded JSON with PDF URLs
+        for script in soup.find_all('script'):
+            script_content = script.string or script.get_text()
+            if script_content:
+                found = self._extract_urls_from_text(script_content, base_url)
+                downloadables.update(found)
+        
+        # 2. Data attributes on any element
+        for element in soup.find_all(True):  # All elements
+            for attr_name, attr_value in element.attrs.items():
+                if attr_name.startswith('data-') and attr_value:
+                    if isinstance(attr_value, str):
+                        # Check if the value itself is a URL
+                        if any(ext in attr_value.lower() for ext in self.downloadable_extensions):
+                            found = self._extract_urls_from_text(attr_value, base_url)
+                            downloadables.update(found)
+                            # Also try treating it as a direct URL
+                            absolute = urljoin(base_url, attr_value)
+                            if self._is_valid_downloadable_url(absolute):
+                                downloadables.add(absolute)
+        
+        # 3. onclick and similar handlers
+        for element in soup.find_all(onclick=True):
+            onclick = element.get('onclick', '')
+            if onclick:
+                found = self._extract_urls_from_text(onclick, base_url)
+                downloadables.update(found)
+        
+        for element in soup.find_all(onmousedown=True):
+            handler = element.get('onmousedown', '')
+            if handler:
+                found = self._extract_urls_from_text(handler, base_url)
+                downloadables.update(found)
+        
+        # 4. iframe src
+        for iframe in soup.find_all('iframe', src=True):
+            src = iframe.get('src', '')
+            absolute = urljoin(base_url, src)
+            if self._is_valid_downloadable_url(absolute):
+                downloadables.add(absolute)
+        
+        # 5. embed and object tags
+        for embed in soup.find_all('embed', src=True):
+            src = embed.get('src', '')
+            absolute = urljoin(base_url, src)
+            if self._is_valid_downloadable_url(absolute):
+                downloadables.add(absolute)
+        
+        for obj in soup.find_all('object', data=True):
+            data = obj.get('data', '')
+            absolute = urljoin(base_url, data)
+            if self._is_valid_downloadable_url(absolute):
+                downloadables.add(absolute)
+        
+        # 6. Meta refresh or other meta redirects
+        for meta in soup.find_all('meta', content=True):
+            content = meta.get('content', '')
+            found = self._extract_urls_from_text(content, base_url)
+            downloadables.update(found)
+        
+        # 7. Final pass: regex on entire HTML for any missed URLs
+        # This catches dynamically constructed URLs in minified JS
+        final_pass = self._extract_urls_from_text(html_text, base_url)
+        downloadables.update(final_pass)
+        
+        return downloadables
+
     def crawl_page(self, url: str) -> dict:
         """Visit a URL and extract all links from the page."""
         self.logger.info(f"Crawling page: {url}")
@@ -221,6 +394,18 @@ class PageCrawler:
             "links": [],
             "downloadables": []
         }
+
+        # Check if the URL itself is a downloadable file (e.g., .pdf, .doc)
+        # If so, treat the URL as a downloadable and don't try to parse it as HTML
+        if self._is_downloadable_url(url):
+            self.logger.info(f"URL is a direct downloadable: {url}")
+            result["downloadables"] = [url]
+            result["metadata"]["total_downloadables"] = 1
+            result["status"] = "DOWNLOADABLE"
+            # Track globally
+            with self.downloadables_lock:
+                self.all_downloadables.add(url)
+            return result
 
         try:
             self.delay_manager.wait()
@@ -257,8 +442,11 @@ class PageCrawler:
                 path_lower = parsed.path.lower()
 
                 # Skip .aspx pages
-                if path_lower.endswith(".aspx") :
+                skip_ext = (".aspx", ".mp4", ".mov",".jpeg",".jpg",".png",".gif",".svg")
+
+                if path_lower.endswith(skip_ext):
                     continue
+
 
                 # Categorize
                 is_downloadable = False
@@ -270,6 +458,10 @@ class PageCrawler:
 
                 if not is_downloadable:
                     collected_links["links"].add(absolute_url)
+
+            # Deep extraction: Find downloadables in scripts, data attributes, etc.
+            deep_downloadables = self._extract_downloadables_deep(soup, response.text, url)
+            collected_links["downloadables"].update(deep_downloadables)
 
             for key in collected_links:
                 result[key] = sorted(list(collected_links[key]))
@@ -314,6 +506,25 @@ class PageCrawler:
         most relevant URLs first. Links scoring below SCORE_THRESHOLD are
         discarded and never visited.
         """
+
+        # Check if start URL is from a blacklisted domain - skip entirely
+        try:
+            start_netloc = urlparse(start_url).netloc.lower()
+            for bad_domain in self.BLACKLIST_DOMAINS:
+                if bad_domain in start_netloc:
+                    self.logger.info(f"Skipping blacklisted domain: {start_url}")
+                    return {
+                        "site_structure": {},
+                        "metadata": {
+                            "total_pages_crawled": 0,
+                            "total_links_found": 0,
+                            "total_downloadables_found": 0,
+                            "skipped": True,
+                            "reason": f"Blacklisted domain: {bad_domain}"
+                        }
+                    }
+        except:
+            pass
 
         normalized_start = self.normalize_url(start_url)
 
@@ -370,7 +581,16 @@ class PageCrawler:
 
                 self.logger.info(f"Processing batch of {len(current_batch)} URLs (queue remaining: {len(pq)})...")
 
-                for future in concurrent.futures.as_completed(future_to_url):
+                # Use environment variable for timeout, default to 120s
+                batch_timeout = int(os.getenv("BATCH_PROCESSING_TIMEOUT", "120"))
+
+                done, not_done = concurrent.futures.wait(
+                    future_to_url.keys(), 
+                    timeout=batch_timeout, 
+                    return_when=concurrent.futures.ALL_COMPLETED
+                )
+
+                for future in done:
                     url = future_to_url[future]
                     try:
                         page_data = future.result()
@@ -407,6 +627,13 @@ class PageCrawler:
 
                     except Exception as e:
                         self.logger.error(f"Error processing {url}: {e}")
+
+                if not_done:
+                    self.logger.warning(f"Batch timeout: {len(not_done)} URLs did not finish in {batch_timeout}s. Moving on.")
+                    for future in not_done:
+                        future.cancel()
+                        u = future_to_url.get(future, "unknown")
+                        self.logger.warning(f"Skipped stuck URL: {u}")
 
         self.logger.info(f"Priority Crawl Completed. Total pages: {metadata['total_pages_crawled']}")
 

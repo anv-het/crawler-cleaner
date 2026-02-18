@@ -22,13 +22,33 @@ import argparse
 import glob
 import time
 import re
+import signal
 from pathlib import Path
 from dotenv import load_dotenv
 
 from logger import setup_logger, set_current_company
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+
+def _signal_handler(signum, frame):
+    """Handle interrupt signals gracefully."""
+    global _shutdown_requested
+    if _shutdown_requested:
+        print("\n[FORCE EXIT] Second interrupt received. Exiting immediately.")
+        sys.exit(1)
+    _shutdown_requested = True
+    print("\n[INTERRUPT] Shutdown requested. Finishing current company... (Press Ctrl+C again to force exit)")
+
+# Register signal handlers
+signal.signal(signal.SIGINT, _signal_handler)
+if hasattr(signal, 'SIGTERM'):
+    signal.signal(signal.SIGTERM, _signal_handler)
 from utils import clean_company_name, save_json, load_json
 from ranker import rank_investor_pages
 from scraper import PageCrawler
+from link_filter import process_company_file, run_link_filter  # Import the new filter logic
+
 
 # Load env from project root (works on both Windows and Linux)
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -102,25 +122,25 @@ def find_matching_files(base_path: str, query: str, extension: str = ".json") ->
 
 
 def get_all_folders(base_path: str) -> list:
-    """Return all subdirectories in base_path."""
+    """Return all subdirectories in base_path, sorted alphabetically."""
     if not os.path.isdir(base_path):
         return []
-    return [
+    return sorted([
         os.path.join(base_path, d)
         for d in os.listdir(base_path)
         if os.path.isdir(os.path.join(base_path, d))
-    ]
+    ], key=lambda x: os.path.basename(x).lower())
 
 
 def get_all_files(base_path: str, extension: str = ".json") -> list:
-    """Return all files with given extension in base_path."""
+    """Return all files with given extension in base_path, sorted alphabetically."""
     if not os.path.isdir(base_path):
         return []
-    return [
+    return sorted([
         os.path.join(base_path, f)
         for f in os.listdir(base_path)
         if f.lower().endswith(extension) and os.path.isfile(os.path.join(base_path, f))
-    ]
+    ], key=lambda x: os.path.basename(x).lower())
 
 
 # ============================================================================
@@ -266,11 +286,20 @@ def step_crawl(ranked_filepath: str, logger) -> tuple:
 
     crawled_path = os.getenv("DATA_CRAWLED_PATH", "DATA/Crawled")
     crawled_filename = f"{company_name}_crawled.json"
+    full_crawled_path = os.path.join(crawled_path, crawled_filename)
     save_json(crawled_data, crawled_path, crawled_filename)
-    logger.info(f"Saved crawled results to: {crawled_path}/{crawled_filename}")
+    logger.info(f"Saved crawled results to: {full_crawled_path}")
 
-    # Also save pdf links immediately
-    _save_pdf_links(company_name, unique_downloadables, logger)
+    # Also extract and filter PDF links immediately
+    try:
+        pdf_links_path = os.getenv("DATA_PDF_LINKS_PATH", "DATA/Pdf_links")
+        result = process_company_file(full_crawled_path, output_dir=pdf_links_path)
+        if "Error" in result:
+            logger.error(result)
+        else:
+            logger.info(result)
+    except Exception as e:
+        logger.error(f"Error extracting PDF links for {company_name}: {e}")
 
     crawler.close()
 
@@ -279,51 +308,26 @@ def step_crawl(ranked_filepath: str, logger) -> tuple:
 
 def step_pdf(crawled_filepath: str, logger):
     """
-    Step 3: Extract unique downloadable links from an existing crawled JSON.
+    Step 3: Extract & Filter unique downloadable links from an existing crawled JSON.
     Useful for re-extracting without re-crawling.
+    Uses link_filter.py logic.
     """
-    data = load_json(crawled_filepath)
-    if not data:
-        logger.warning(f"Invalid crawled file: {crawled_filepath}")
-        return
+    try:
+        # Get output path from env or default
+        pdf_links_path = os.getenv("DATA_PDF_LINKS_PATH", "DATA/Pdf_links")
+        
+        # Simply delegate to the new processor which handles loading, filtering, and saving
+        result = process_company_file(crawled_filepath, output_dir=pdf_links_path)
+        
+        if "Error" in result:
+            logger.error(result)
+        else:
+            logger.info(result)
+    except Exception as e:
+        logger.error(f"Error extracting PDF links from {crawled_filepath}: {e}")
 
-    company_name = data.get("company", "Unknown")
-    logger.info(f"Extracting PDF links: {company_name}")
+# (Old _save_pdf_links removed as it is now handled by link_filter.py)
 
-    # Collect all unique downloadable links from the crawled structure
-    all_links = set()
-
-    def _walk_tree(node):
-        """Recursively walk the site_structure tree and collect downloadable links."""
-        if isinstance(node, dict):
-            if "downloadables" in node and isinstance(node["downloadables"], list):
-                all_links.update(node["downloadables"])
-            for key, value in node.items():
-                if key.startswith("_") or key in ("downloadables", "links"):
-                    continue
-                _walk_tree(value)
-
-    for result in data.get("crawled_results", []):
-        structure = result.get("site_structure", {})
-        _walk_tree(structure)
-
-    unique_list = sorted(list(all_links))
-    _save_pdf_links(company_name, unique_list, logger)
-
-
-def _save_pdf_links(company_name: str, links: list, logger):
-    """Save unique downloadable links to DATA/Pdf_links/."""
-    pdf_links_path = os.getenv("DATA_PDF_LINKS_PATH", "DATA/Pdf_links")
-    pdf_links_data = {
-        "company": company_name,
-        "metadata": {
-            "unique_links_count": len(links)
-        },
-        "downloadable_links": links
-    }
-    pdf_links_filename = f"{company_name}.json"
-    save_json(pdf_links_data, pdf_links_path, pdf_links_filename)
-    logger.info(f"Saved {len(links)} unique downloadable links to: {pdf_links_path}/{pdf_links_filename}")
 
 
 # ============================================================================
@@ -335,11 +339,12 @@ PROGRESS_FILENAME = "progress.json"
 
 def _get_progress_path() -> str:
     """Return path to the progress tracking file (DATA/progress.json)."""
-    raw_path = os.getenv("DATA_RAW_PATH", "DATA/Raw")
-    data_root = os.path.dirname(raw_path)          # DATA/
-    if not data_root:
-        data_root = "DATA"
-    return os.path.join(data_root, PROGRESS_FILENAME)
+    path = os.getenv("PROGRESS_FILE_PATH", "DATA/progress.json")
+    # Ensure directory exists
+    folder = os.path.dirname(path)
+    if folder and not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+    return path
 
 
 def _load_completed(logger) -> set:
@@ -395,6 +400,7 @@ Examples:
     parser.add_argument("--rank", action="store_true", help="Run only the ranking step")
     parser.add_argument("--crawl", action="store_true", help="Run only the crawling step (needs ranked data)")
     parser.add_argument("--pdf", action="store_true", help="Run only PDF/downloadable link extraction (needs crawled data)")
+    parser.add_argument("--force", action="store_true", help="Force re-processing even if already completed (ignores progress)")
     return parser.parse_args()
 
 
@@ -410,8 +416,10 @@ def main():
     ranked_path = os.getenv("DATA_RANKED_PATH", "DATA/Ranked")
     crawled_path = os.getenv("DATA_CRAWLED_PATH", "DATA/Crawled")
 
-    # Resume switch from .env
-    resume_enabled = os.getenv("RESUME", "true").lower() == "true"
+    # Resume switch from .env (--force overrides it)
+    resume_enabled = os.getenv("RESUME", "true").lower() == "true" and not args.force
+    if args.force:
+        logger.info("--force flag set: ignoring progress, will re-process all matched companies.")
 
     # Determine which steps to run
     run_rank = args.rank
@@ -453,6 +461,11 @@ def main():
             _clear_progress(logger)
 
         for i, folder in enumerate(targets, 1):
+            # Check for shutdown request
+            if _shutdown_requested:
+                logger.info("Shutdown requested. Stopping after current company.")
+                break
+
             folder_name = os.path.basename(folder)
 
             # Skip already completed (resume mode)
@@ -503,8 +516,15 @@ def main():
                 pdf_file = os.path.join(pdf_links_path, f"{company_name}.json")
                 if os.path.exists(pdf_file):
                     pdf_data = load_json(pdf_file)
-                    count = pdf_data.get("metadata", {}).get("unique_links_count", 0) if pdf_data else 0
-                    logger.info(f"PDF links file exists: {count} unique links.")
+                    # For new format, count is at useful_links_count
+                    if "metadata" in pdf_data and "useful_links_count" in pdf_data["metadata"]:
+                         count = pdf_data["metadata"]["useful_links_count"]
+                         uncertain = pdf_data["metadata"].get("uncertain_links_count", 0)
+                         logger.info(f"PDF links file exists: {count} useful, {uncertain} uncertain.")
+                    else:
+                        # Fallback for old format or unexpected structure
+                        count = pdf_data.get("metadata", {}).get("unique_links_count", 0)
+                        logger.info(f"PDF links file exists: {count} unique links.")
                 else:
                     logger.warning(f"PDF links file not found for {company_name}.")
 
@@ -547,6 +567,9 @@ def main():
 
         logger.info(f"Found {len(targets)} folder(s) to rank.")
         for folder in targets:
+            if _shutdown_requested:
+                logger.info("Shutdown requested. Stopping.")
+                break
             try:
                 display_name = clean_company_name(os.path.basename(folder).replace("_", " "))
                 set_current_company(display_name)
@@ -577,6 +600,9 @@ def main():
 
         logger.info(f"Found {len(ranked_files)} ranked file(s) to crawl.")
         for rfile in ranked_files:
+            if _shutdown_requested:
+                logger.info("Shutdown requested. Stopping.")
+                break
             try:
                 display_name = os.path.splitext(os.path.basename(rfile))[0].replace("_ranked", "").strip()
                 set_current_company(display_name)
@@ -588,32 +614,42 @@ def main():
     # STEP: PDF LINKS
     if run_pdf:
         logger.info("=" * 60)
-        logger.info("STEP: PDF LINK EXTRACTION")
+        logger.info("STEP: PDF LINK EXTRACTION & FILTERING")
         logger.info("=" * 60)
 
         if not os.path.isdir(crawled_path):
             logger.error(f"Crawled data path not found: {crawled_path}")
             return
 
+        # Define output path (defaulting to DATA/Pdf_links if not set)
+        pdf_links_path = os.getenv("DATA_PDF_LINKS_PATH", "DATA/Pdf_links")
+
         if company_query:
+            # If specific company requested, use the existing loop logic
             crawled_files = find_matching_files(crawled_path, company_query, ".json")
             if not crawled_files:
                 logger.warning(f"No crawled files matching '{company_query}' in {crawled_path}")
                 return
+            
+            logger.info(f"Found {len(crawled_files)} crawled file(s) to process.")
+            for cfile in crawled_files:
+                if _shutdown_requested:
+                    logger.info("Shutdown requested. Stopping.")
+                    break
+                try:
+                    display_name = os.path.splitext(os.path.basename(cfile))[0].replace("_crawled", "").strip()
+                    set_current_company(display_name)
+                    step_pdf(cfile, logger)
+                except Exception as e:
+                    logger.error(f"Error extracting PDF links from {cfile}: {e}")
+            set_current_company(None)
         else:
-            crawled_files = get_all_files(crawled_path, ".json")
-
-        logger.info(f"Found {len(crawled_files)} crawled file(s) to extract PDF links from.")
-        for cfile in crawled_files:
-            try:
-                display_name = os.path.splitext(os.path.basename(cfile))[0].replace("_crawled", "").strip()
-                set_current_company(display_name)
-                step_pdf(cfile, logger)
-            except Exception as e:
-                logger.error(f"Error extracting PDF links from {cfile}: {e}")
-        set_current_company(None)
+            # If processing ALL companies, use the multiprocessing function from link_filter
+            logger.info("Running parallel link filtering on all crawled files...")
+            run_link_filter(input_dir=crawled_path, output_dir=pdf_links_path)
 
     logger.info("=" * 60)
+
     logger.info("Pipeline finished.")
     logger.info("=" * 60)
 
