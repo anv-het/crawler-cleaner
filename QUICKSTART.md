@@ -44,6 +44,8 @@ Key settings you might want to change:
 TOP_URLS_TO_VISIT=3        # How many top-ranked URLs to crawl per company
 MAX_WORKERS=60             # Concurrent crawl threads
 RESUME=true                # true = resume from last stop, false = start fresh
+START_RANGE=1              # Optional: Start processing from this company index (1-based)
+END_RANGE=50               # Optional: Stop processing at this company index (1-based)
 ```
 
 ## 4. Run

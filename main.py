@@ -450,6 +450,31 @@ def main():
         else:
             targets = get_all_folders(raw_path)
 
+        # Filter by START_RANGE and END_RANGE if provided
+        start_range_env = os.getenv("START_RANGE")
+        end_range_env = os.getenv("END_RANGE")
+
+        if start_range_env or end_range_env:
+            try:
+                # Default start is 1 (index 0) if not provided
+                start_val = int(start_range_env) if start_range_env else 1
+                start_idx = start_val - 1  # 1-based input -> 0-based index
+                
+                end_idx = int(end_range_env) if end_range_env else None
+                
+                if start_idx < 0:
+                    start_idx = 0
+
+                original_count = len(targets)
+                if end_idx:
+                    targets = targets[start_idx:end_idx]
+                else:
+                    targets = targets[start_idx:]
+
+                logger.info(f"Applied range filter: START={start_val}, END={end_range_env}. Reduced targets from {original_count} to {len(targets)}.")
+            except ValueError:
+                logger.error("Invalid START_RANGE or END_RANGE. Please provide integers.")
+
         total = len(targets)
         logger.info(f"Found {total} company folder(s) to process.")
 

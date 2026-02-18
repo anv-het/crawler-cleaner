@@ -191,9 +191,12 @@ DELAY_MIN=0.5              # Min delay between requests
 # Pipeline Settings
 RESUME=true                # true = skip completed companies
 SAVE_TO_JSON=true          # Save results locally
+START_RANGE=1              # Process from this index (1-based)
+END_RANGE=50               # Process until this index (1-based)
 
 # Paths
 DATA_RAW_PATH=DATA/Raw
+
 DATA_PDF_LINKS_PATH=DATA/Pdf_links
 ```
 
